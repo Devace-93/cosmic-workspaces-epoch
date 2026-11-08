@@ -93,7 +93,9 @@ impl<Msg> Widget<Msg, cosmic::Theme, cosmic::Renderer> for WorkspaceStrip<'_, Ms
             .zip(&mut tree.children)
             .zip(layout.children())
         {
-            child.as_widget_mut().operate(tree, layout, renderer, operation);
+            child
+                .as_widget_mut()
+                .operate(tree, layout, renderer, operation);
         }
     }
 

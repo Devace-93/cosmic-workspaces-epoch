@@ -149,9 +149,21 @@ pub(crate) fn layer_surface<'a>(
         crate::widgets::workspace_strip(pages, crate::swipe::layout_axis(layout), width, height)
             .into()
     } else if let Some(workspace) = first_active_workspace {
-        toplevel_previews(toplevels_on(workspace.handle()), layout, drag_toplevel, window_id, rectangle_track)
+        toplevel_previews(
+            toplevels_on(workspace.handle()),
+            layout,
+            drag_toplevel,
+            window_id,
+            rectangle_track,
+        )
     } else {
-        toplevel_previews(std::iter::empty(), layout, drag_toplevel, window_id, rectangle_track)
+        toplevel_previews(
+            std::iter::empty(),
+            layout,
+            drag_toplevel,
+            window_id,
+            rectangle_track,
+        )
     };
     let toplevels = if let Some(workspace) = first_active_workspace {
         dnd_destination_for_target(
@@ -712,26 +724,34 @@ fn toplevel_previews<'a>(
 /// Outline of an empty window, so an empty workspace still shows movement
 /// while swiping past it (otherwise every empty page looks identical).
 fn empty_workspace_placeholder() -> cosmic::Element<'static, Msg> {
-    let outline = widget::container(widget::Space::new().width(Length::Fill).height(Length::Fill))
-        .width(Length::FillPortion(2))
-        .height(Length::FillPortion(2))
-        .class(cosmic::theme::Container::custom(|theme| {
-            let cosmic = theme.cosmic();
-            let mut border_color: iced::Color = cosmic.on_bg_color().into();
-            border_color.a = 0.35;
-            let mut background: iced::Color = cosmic.background(false).base.into();
-            background.a = 0.25;
-            cosmic::iced::widget::container::Style {
-                background: Some(background.into()),
-                border: Border {
-                    color: border_color,
-                    width: 2.0,
-                    radius: cosmic.radius_s().map(|x| x + 4.0).into(),
-                },
-                ..Default::default()
-            }
-        }));
-    let spacer = || widget::Space::new().width(Length::FillPortion(1)).height(Length::FillPortion(1));
+    let outline = widget::container(
+        widget::Space::new()
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .width(Length::FillPortion(2))
+    .height(Length::FillPortion(2))
+    .class(cosmic::theme::Container::custom(|theme| {
+        let cosmic = theme.cosmic();
+        let mut border_color: iced::Color = cosmic.on_bg_color().into();
+        border_color.a = 0.35;
+        let mut background: iced::Color = cosmic.background(false).base.into();
+        background.a = 0.25;
+        cosmic::iced::widget::container::Style {
+            background: Some(background.into()),
+            border: Border {
+                color: border_color,
+                width: 2.0,
+                radius: cosmic.radius_s().map(|x| x + 4.0).into(),
+            },
+            ..Default::default()
+        }
+    }));
+    let spacer = || {
+        widget::Space::new()
+            .width(Length::FillPortion(1))
+            .height(Length::FillPortion(1))
+    };
     column![
         spacer(),
         row![spacer(), outline, spacer()].height(Length::FillPortion(2)),
