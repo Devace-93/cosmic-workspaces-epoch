@@ -74,6 +74,9 @@ pub struct AppData {
     dmabuf_feedback: Option<DmabufFeedback>,
     gbm_devices: GbmDevices,
     thread_pool: ThreadPool,
+    /// Captures to request again, handled on the Wayland thread's event loop
+    /// (see `screencopy::ready`).
+    recapture_sender: calloop::channel::Sender<std::sync::Weak<Capture>>,
     vulkan: Option<vulkan::Vulkan>,
 }
 
@@ -298,6 +301,9 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
             );
         }
 
+        let (recapture_sender, recapture_channel) = calloop::channel::channel();
+        let recapture_conn = conn.clone();
+
         let registry_state = RegistryState::new(&globals);
         let mut app_data = AppData {
             qh: qh.clone(),
@@ -315,6 +321,7 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
             dmabuf_feedback: None,
             gbm_devices: GbmDevices::default(),
             thread_pool,
+            recapture_sender,
             vulkan: vulkan.ok(),
         };
 
@@ -330,6 +337,20 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
             .insert_source(cmd_channel, |event, _, app_data| {
                 if let calloop::channel::Event::Msg(msg) = event {
                     app_data.handle_cmd(msg)
+                }
+            })
+            .unwrap();
+        event_loop
+            .handle()
+            .insert_source(recapture_channel, move |event, _, app_data| {
+                if let calloop::channel::Event::Msg(capture) = event {
+                    let Some(capture) = capture.upgrade() else {
+                        return;
+                    };
+                    let mut session = capture.session.lock().unwrap();
+                    if let Some(session) = session.as_mut() {
+                        session.attach_buffer_and_commit(&capture, &recapture_conn, &app_data.qh);
+                    }
                 }
             })
             .unwrap();

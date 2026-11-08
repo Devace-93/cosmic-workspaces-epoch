@@ -50,7 +50,7 @@ impl ScreencopySession {
         }
     }
 
-    fn attach_buffer_and_commit(
+    pub(super) fn attach_buffer_and_commit(
         &mut self,
         capture: &Arc<Capture>,
         conn: &Connection,
@@ -131,8 +131,8 @@ impl ScreencopyHandler for AppData {
 
     fn ready(
         &mut self,
-        conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
         capture_frame: &CaptureFrame,
         frame: Frame,
     ) {
@@ -153,21 +153,20 @@ impl ScreencopyHandler for AppData {
         // swap buffers
         session.buffers.as_mut().unwrap().rotate_left(1);
 
-        // Capture again on damage
-        let capture_clone = capture.clone();
-        let conn = conn.clone();
+        // Capture again on damage, once the server released the buffer.
+        // The next frame must not be created before this one is destroyed,
+        // which the toolkit does only after `ready` returns; so the capture is
+        // requested from the Wayland thread's event loop, never from here or
+        // from the thread pool directly.
+        let capture_weak = Arc::downgrade(&capture);
         let release = session.release.take();
-        let qh = qh.clone();
+        let recapture = self.recapture_sender.clone();
         self.thread_pool.spawn_ok(async move {
             if let Some(release) = release {
                 // Wait for buffer to be released by server
                 release.await;
             }
-            let mut session = capture_clone.session.lock().unwrap();
-            let Some(session) = session.as_mut() else {
-                return;
-            };
-            session.attach_buffer_and_commit(&capture_clone, &conn, &qh);
+            let _ = recapture.send(capture_weak);
         });
 
         // Clear `buffer_damage` for front buffer; accumulate for other buffers.
@@ -215,7 +214,7 @@ impl ScreencopyHandler for AppData {
 
     fn failed(
         &mut self,
-        conn: &Connection,
+        _conn: &Connection,
         _qh: &QueueHandle<Self>,
         capture_frame: &CaptureFrame,
         reason: WEnum<FailureReason>,
@@ -234,7 +233,9 @@ impl ScreencopyHandler for AppData {
             if let Some(formats) = &session.formats {
                 session.buffers = Some(array::from_fn(|_| self.create_buffer(formats)));
             }
-            session.attach_buffer_and_commit(&capture, conn, &self.qh);
+            // Not from inside this handler: the failed frame is destroyed
+            // only after it returns (see `ready`).
+            let _ = self.recapture_sender.send(Arc::downgrade(&capture));
         } else {
             // TODO
             if reason == WEnum::Value(FailureReason::Stopped) {
