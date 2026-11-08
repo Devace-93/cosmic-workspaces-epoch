@@ -394,27 +394,33 @@ impl App {
             let Some(active) = workspaces.iter().position(|w| w.is_active()) else {
                 continue;
             };
+            // In pages, as `swipe::Gesture::pos` (unbounded with wraparound).
             let (mut lo, mut hi) = (active as f32, active as f32);
             if let Some(pos) = self.strip_pos(&output.handle) {
                 lo = lo.min(pos.floor());
                 hi = hi.max(pos.ceil());
             }
-            let settle_target = self
+            if let Some(page) = self
                 .settle
                 .as_ref()
                 .filter(|s| s.output == output.handle)
-                .and_then(|s| workspaces.iter().position(|w| w.handle() == &s.target));
-            if let Some(idx) = settle_target {
-                lo = lo.min(idx as f32);
-                hi = hi.max(idx as f32);
+                .and_then(|s| self.settle_target_page(s))
+            {
+                lo = lo.min(page);
+                hi = hi.max(page);
             }
-            let last = workspaces.len() - 1;
-            let lo = (lo - 1.0).max(0.0) as usize;
-            let hi = ((hi + 1.0) as usize).min(last);
-            for workspace in &workspaces[lo..=hi] {
-                if !handles.contains(workspace.handle()) {
-                    handles.push(workspace.handle().clone());
+            let wrap = self.conf.workspace_config.workspace_wraparound;
+            // At most one lap: further pages would only repeat workspaces.
+            let hi = (hi + 1.0).min(lo - 1.0 + workspaces.len() as f32);
+            let mut page = lo - 1.0;
+            while page <= hi {
+                if let Some(idx) = swipe::page_index(page, workspaces.len(), wrap) {
+                    let handle = workspaces[idx].handle();
+                    if !handles.contains(handle) {
+                        handles.push(handle.clone());
+                    }
                 }
+                page += 1.0;
             }
         }
         handles
@@ -473,6 +479,15 @@ impl App {
         Some(settle.pos(idx, std::time::Instant::now()))
     }
 
+    /// Page the settle animation is heading to, in `strip_pos` space.
+    fn settle_target_page(&self, settle: &swipe::Settle) -> Option<f32> {
+        let idx = self
+            .workspaces
+            .for_output(&settle.output)
+            .position(|w| w.handle() == &settle.target)?;
+        Some(settle.target_page(idx))
+    }
+
     /// End the settle animation and switch to the workspace it landed on.
     fn finish_settle(&mut self) {
         if let Some(settle) = self.settle.take() {
@@ -528,6 +543,7 @@ impl App {
                     self.swipe_deaccel,
                     start,
                     count,
+                    self.conf.workspace_config.workspace_wraparound,
                 ));
                 self.settle = None;
             }
@@ -544,19 +560,22 @@ impl App {
                 if !gesture.is_active() {
                     return;
                 }
-                let target_idx = gesture.target(time);
-                log::debug!(
-                    "swipe end: pos={:.2} velocity={:.2} cancelled={cancelled} -> target {target_idx}",
-                    gesture.pos(),
-                    gesture.velocity(time)
-                );
+                let target_page = gesture.target(time);
                 let workspaces = self
                     .workspaces
                     .for_output(&gesture.output)
                     .collect::<Vec<_>>();
-                let Some(target) = workspaces.get(target_idx) else {
+                let wrap = self.conf.workspace_config.workspace_wraparound;
+                let Some(target_idx) = swipe::page_index(target_page, workspaces.len(), wrap)
+                else {
                     return;
                 };
+                log::debug!(
+                    "swipe end: pos={:.2} velocity={:.2} cancelled={cancelled} -> target {target_idx} (page {target_page})",
+                    gesture.pos(),
+                    gesture.velocity(time)
+                );
+                let target = workspaces[target_idx];
                 // The workspace is activated when the animation ends: the
                 // compositor may add/remove empty workspaces on a switch,
                 // which would reflow the bar and shift indices mid-animation.
@@ -564,6 +583,7 @@ impl App {
                     gesture.output.clone(),
                     target.handle().clone(),
                     target_idx,
+                    target_page,
                     gesture.pos(),
                     gesture.velocity(time),
                 ));

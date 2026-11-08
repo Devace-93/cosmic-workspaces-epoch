@@ -148,6 +148,9 @@ pub struct Gesture {
     start_pos: f32,
     /// Number of workspaces on the output.
     count: usize,
+    /// cosmic-comp's `workspace_wraparound`: past the last workspace comes
+    /// the first one again (and the other way round) instead of a rubber band.
+    wrap: bool,
     /// `None` until the fingers moved far enough to pick an axis; then
     /// whether that axis is the workspace axis.
     locked: Option<bool>,
@@ -167,6 +170,7 @@ impl Gesture {
         deaccel: Deaccel,
         start_pos: f32,
         count: usize,
+        wrap: bool,
     ) -> Self {
         Self {
             output,
@@ -175,6 +179,7 @@ impl Gesture {
             deaccel,
             start_pos,
             count,
+            wrap: wraps(wrap, count),
             locked: None,
             pending: (0.0, 0.0),
             moved: 0.0,
@@ -258,11 +263,15 @@ impl Gesture {
         self.start_pos + self.moved as f32
     }
 
-    /// Position to draw, with rubber banding past both ends.
+    /// Position to draw, with rubber banding past both ends. With
+    /// wraparound it is unbounded: `-1.0` is the last workspace, reached
+    /// from the first one (see [`page_index`]).
     pub fn pos(&self) -> f32 {
         let last = self.count.saturating_sub(1) as f32;
         let raw = self.raw_pos();
-        if raw < 0.0 {
+        if self.wrap {
+            raw
+        } else if raw < 0.0 {
             -rubber_band(-raw)
         } else if raw > last {
             last + rubber_band(raw - last)
@@ -288,16 +297,40 @@ impl Gesture {
         (total as f32 / dt).clamp(-MAX_RELEASE_VELOCITY, MAX_RELEASE_VELOCITY)
     }
 
-    /// Workspace index to settle on after release at `now` (ms).
+    /// Page to settle on after release at `now` (ms), in the same space
+    /// as [`Gesture::pos`]: always a valid index without wraparound, any
+    /// whole number with it (map it with [`page_index`]).
     ///
     /// libinput marks the end `cancelled` whenever the finger count changes
     /// first (e.g. lifting fingers one at a time), so like cosmic-comp this
     /// ignores it and lands where the fingers left the strip.
-    pub fn target(&self, now: u32) -> usize {
+    pub fn target(&self, now: u32) -> f32 {
         let last = self.count.saturating_sub(1) as f32;
         let pos = self.pos();
         let projected = (pos + self.velocity(now) * PROJECTION_S).round();
-        projected.clamp(0.0, last) as usize
+        if self.wrap {
+            projected
+        } else {
+            projected.clamp(0.0, last)
+        }
+    }
+}
+
+/// Wraparound only means something with two or more workspaces.
+pub fn wraps(wraparound: bool, count: usize) -> bool {
+    wraparound && count > 1
+}
+
+/// Workspace index shown at whole page `page`, or `None` past the ends
+/// without wraparound.
+pub fn page_index(page: f32, count: usize, wraparound: bool) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    if wraps(wraparound, count) {
+        Some((page as i64).rem_euclid(count as i64) as usize)
+    } else {
+        (page >= 0.0 && page <= (count - 1) as f32).then_some(page as usize)
     }
 }
 
@@ -346,6 +379,9 @@ impl Spring {
 pub struct Settle {
     pub output: wl_output::WlOutput,
     pub target: ExtWorkspaceHandleV1,
+    /// Target page minus the target's index: a multiple of the workspace
+    /// count when the swipe wrapped around, else 0.
+    lap: f32,
     spring: Spring,
     start: Instant,
 }
@@ -355,13 +391,15 @@ impl Settle {
         output: wl_output::WlOutput,
         target: ExtWorkspaceHandleV1,
         target_idx: usize,
+        target_page: f32,
         pos: f32,
         velocity: f32,
     ) -> Self {
         Self {
             output,
             target,
-            spring: Spring::new(pos - target_idx as f32, velocity),
+            lap: target_page - target_idx as f32,
+            spring: Spring::new(pos - target_page, velocity),
             start: Instant::now(),
         }
     }
@@ -371,9 +409,14 @@ impl Settle {
             .at(now.saturating_duration_since(self.start).as_secs_f32())
     }
 
+    /// Page the animation ends on, given where the target workspace is now.
+    pub fn target_page(&self, target_idx: usize) -> f32 {
+        target_idx as f32 + self.lap
+    }
+
     /// Current position, given where the target workspace is now.
     pub fn pos(&self, target_idx: usize, now: Instant) -> f32 {
-        target_idx as f32 + self.offset_and_velocity(now).0
+        self.target_page(target_idx) + self.offset_and_velocity(now).0
     }
 
     pub fn is_done(&self, now: Instant) -> bool {
@@ -384,20 +427,16 @@ impl Settle {
 
 /// Indices of the (at most two) workspaces visible at `pos`, with the offset
 /// of each page from the viewport in pages.
-pub fn visible_pages(pos: f32, count: usize) -> Vec<(usize, f32)> {
-    if count == 0 {
-        return Vec::new();
-    }
-    let last = count - 1;
+pub fn visible_pages(pos: f32, count: usize, wraparound: bool) -> Vec<(usize, f32)> {
     let lo = pos.floor();
     let mut pages = Vec::with_capacity(2);
-    for idx in [lo, lo + 1.0] {
-        if idx < 0.0 || idx > last as f32 {
+    for page in [lo, lo + 1.0] {
+        let offset = page - pos;
+        if offset.abs() >= 1.0 {
             continue;
         }
-        let offset = idx - pos;
-        if offset.abs() < 1.0 {
-            pages.push((idx as usize, offset));
+        if let Some(idx) = page_index(page, count, wraparound) {
+            pages.push((idx, offset));
         }
     }
     pages
@@ -409,11 +448,31 @@ mod tests {
 
     #[test]
     fn visible_pages_at_rest_and_between() {
-        assert_eq!(visible_pages(1.0, 3), vec![(1, 0.0)]);
-        assert_eq!(visible_pages(1.25, 3), vec![(1, -0.25), (2, 0.75)]);
+        assert_eq!(visible_pages(1.0, 3, false), vec![(1, 0.0)]);
+        assert_eq!(visible_pages(1.25, 3, false), vec![(1, -0.25), (2, 0.75)]);
         // Rubber band past the ends only shows the end page.
-        assert_eq!(visible_pages(-0.1, 3).len(), 1);
-        assert_eq!(visible_pages(2.1, 3).len(), 1);
+        assert_eq!(visible_pages(-0.1, 3, false).len(), 1);
+        assert_eq!(visible_pages(2.1, 3, false).len(), 1);
+    }
+
+    #[test]
+    fn visible_pages_wrap_around() {
+        // Between the last and the first workspace, both ways.
+        assert_eq!(visible_pages(-0.25, 3, true), vec![(2, -0.75), (0, 0.25)]);
+        assert_eq!(visible_pages(2.5, 3, true), vec![(2, -0.5), (0, 0.5)]);
+        // Several laps away.
+        assert_eq!(visible_pages(-4.0, 3, true), vec![(2, 0.0)]);
+        // A single workspace never wraps.
+        assert_eq!(visible_pages(-0.1, 1, true), vec![(0, 0.1)]);
+    }
+
+    #[test]
+    fn page_index_clamps_or_wraps() {
+        assert_eq!(page_index(-1.0, 4, false), None);
+        assert_eq!(page_index(4.0, 4, false), None);
+        assert_eq!(page_index(-1.0, 4, true), Some(3));
+        assert_eq!(page_index(4.0, 4, true), Some(0));
+        assert_eq!(page_index(0.0, 0, true), None);
     }
 
     #[test]

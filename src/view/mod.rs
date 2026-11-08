@@ -100,7 +100,14 @@ pub(crate) fn layer_surface<'a>(
             .workspaces
             .for_output(&surface.output)
             .collect::<Vec<_>>();
-        let idx = (pos.round().max(0.0) as usize).min(workspaces.len().checked_sub(1)?);
+        let wrap = app.conf.workspace_config.workspace_wraparound;
+        let last = workspaces.len().checked_sub(1)? as f32;
+        let page = if crate::swipe::wraps(wrap, workspaces.len()) {
+            pos.round()
+        } else {
+            pos.round().clamp(0.0, last)
+        };
+        let idx = crate::swipe::page_index(page, workspaces.len(), wrap)?;
         Some(workspaces[idx].handle())
     });
     // track this rectangle
@@ -132,7 +139,8 @@ pub(crate) fn layer_surface<'a>(
             .workspaces
             .for_output(&surface.output)
             .collect::<Vec<_>>();
-        let pages = crate::swipe::visible_pages(pos, workspaces.len())
+        let wrap = app.conf.workspace_config.workspace_wraparound;
+        let pages = crate::swipe::visible_pages(pos, workspaces.len(), wrap)
             .into_iter()
             .map(|(idx, offset)| {
                 let page = toplevel_previews(
