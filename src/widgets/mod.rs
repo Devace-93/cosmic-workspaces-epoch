@@ -20,6 +20,8 @@ mod visibility_wrapper;
 pub use visibility_wrapper::visibility_wrapper;
 mod match_size;
 pub use match_size::match_size;
+mod workspace_strip;
+pub use workspace_strip::workspace_strip;
 
 // Widget for debugging
 #[allow(dead_code)]

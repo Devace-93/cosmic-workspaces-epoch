@@ -15,7 +15,9 @@ use cctk::{
     toplevel_info::ToplevelInfoState,
     toplevel_management::ToplevelManagerState,
     wayland_client::{
-        Connection, Proxy, QueueHandle, globals::registry_queue_init, protocol::wl_seat,
+        Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
+        globals::registry_queue_init,
+        protocol::{wl_pointer, wl_seat},
     },
     workspace::WorkspaceState,
 };
@@ -28,6 +30,9 @@ use cosmic::{
 };
 use futures_channel::mpsc;
 use std::{cell::RefCell, collections::HashMap, sync::Arc, thread};
+use wayland_protocols::wp::pointer_gestures::zv1::client::{
+    zwp_pointer_gesture_swipe_v1, zwp_pointer_gestures_v1,
+};
 
 mod buffer;
 use buffer::Buffer;
@@ -42,7 +47,7 @@ mod toplevel;
 mod vulkan;
 mod workspace;
 
-use super::{CaptureFilter, CaptureImage, Cmd, Event};
+use super::{CaptureFilter, CaptureImage, Cmd, Event, SwipeEvent};
 
 pub fn subscription(conn: Connection) -> iced::Subscription<Event> {
     iced::Subscription::run_with_id("wayland-sub", async { start(conn) }.flatten_stream())
@@ -65,6 +70,17 @@ pub struct AppData {
     gbm_devices: GbmDevices,
     thread_pool: futures_executor::ThreadPool,
     vulkan: Option<vulkan::Vulkan>,
+    pointer_gestures: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
+    // Our own `wl_pointer` per seat, used only to get touchpad swipe gestures.
+    // It shares the connection (and so the client) with iced, so the
+    // compositor delivers the gestures that land on our layer surfaces.
+    gesture_pointers: HashMap<
+        wl_seat::WlSeat,
+        (
+            wl_pointer::WlPointer,
+            zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1,
+        ),
+    >,
 }
 
 impl AppData {
@@ -253,18 +269,36 @@ impl SeatHandler for AppData {
     fn new_capability(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
-        _: sctk::seat::Capability,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: sctk::seat::Capability,
     ) {
+        if capability != sctk::seat::Capability::Pointer
+            || self.gesture_pointers.contains_key(&seat)
+        {
+            return;
+        }
+        if let Some(gestures) = &self.pointer_gestures {
+            let pointer = seat.get_pointer(qh, ());
+            let swipe = gestures.get_swipe_gesture(&pointer, qh, ());
+            self.gesture_pointers.insert(seat, (pointer, swipe));
+        }
     }
     fn remove_capability(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
-        _: sctk::seat::Capability,
+        seat: wl_seat::WlSeat,
+        capability: sctk::seat::Capability,
     ) {
+        if capability == sctk::seat::Capability::Pointer {
+            if let Some((pointer, swipe)) = self.gesture_pointers.remove(&seat) {
+                swipe.destroy();
+                if pointer.version() >= 3 {
+                    pointer.release();
+                }
+            }
+        }
     }
 }
 
@@ -281,6 +315,10 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
     let qh = event_queue.handle();
 
     let dmabuf_state = DmabufState::new(&globals, &qh);
+    let pointer_gestures = globals
+        .bind::<zwp_pointer_gestures_v1::ZwpPointerGesturesV1, _, _>(&qh, 1..=1, ())
+        .map_err(|err| log::warn!("pointer gestures not supported: {}", err))
+        .ok();
     if let Err(err) = dmabuf_state.get_default_feedback(&qh) {
         log::warn!("dmabuf feedback not supported, only shm: {}", err);
     }
@@ -311,6 +349,8 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
             gbm_devices: GbmDevices::default(),
             thread_pool,
             vulkan: vulkan::Vulkan::new(),
+            pointer_gestures,
+            gesture_pointers: HashMap::new(),
         };
 
         let (cmd_sender, cmd_channel) = calloop::channel::channel();
@@ -341,3 +381,36 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
 sctk::delegate_registry!(AppData);
 sctk::delegate_seat!(AppData);
 sctk::delegate_shm!(AppData);
+
+// Pointer events go through iced's own `wl_pointer`; ours is only a handle
+// for the swipe gesture object.
+delegate_noop!(AppData: ignore wl_pointer::WlPointer);
+delegate_noop!(AppData: zwp_pointer_gestures_v1::ZwpPointerGesturesV1);
+
+impl Dispatch<zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1, ()> for AppData {
+    fn event(
+        app_data: &mut Self,
+        _: &zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1,
+        event: zwp_pointer_gesture_swipe_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let event = match event {
+            zwp_pointer_gesture_swipe_v1::Event::Begin { time, fingers, .. } => {
+                SwipeEvent::Begin { time, fingers }
+            }
+            zwp_pointer_gesture_swipe_v1::Event::Update { time, dx, dy } => {
+                SwipeEvent::Update { time, dx, dy }
+            }
+            zwp_pointer_gesture_swipe_v1::Event::End {
+                time, cancelled, ..
+            } => SwipeEvent::End {
+                time,
+                cancelled: cancelled != 0,
+            },
+            _ => return,
+        };
+        app_data.send_event(Event::Swipe(event));
+    }
+}

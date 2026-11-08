@@ -23,7 +23,7 @@ use cosmic::{
     },
     iced_core::window::Id as SurfaceId,
     iced_runtime::platform_specific::wayland::layer_surface::{
-        IcedOutput, SctkLayerSurfaceSettings,
+        IcedMargin, IcedOutput, SctkLayerSurfaceSettings,
     },
     iced_winit::platform_specific::wayland::commands::layer_surface::{
         destroy_layer_surface, get_layer_surface,
@@ -50,6 +50,7 @@ mod backend;
 mod view;
 use backend::{ExtForeignToplevelHandleV1, ExtWorkspaceHandleV1, ToplevelInfo};
 mod dnd;
+mod swipe;
 mod utils;
 mod widgets;
 use dnd::{DragSurface, DragToplevel, DragWorkspace, DropTarget};
@@ -118,6 +119,8 @@ enum Msg {
     DBus(dbus::Event),
     PanelContainerEntries(Vec<String>),
     PanelConfig(CosmicPanelConfig),
+    PointerSurface(SurfaceId),
+    Frame,
     Ignore,
 }
 
@@ -168,6 +171,9 @@ struct Output {
 #[derive(Debug)]
 struct LayerSurface {
     output: wl_output::WlOutput,
+    /// How far the surface extends past the output on the left/top (see
+    /// `create_surface`); the view pads its content by this much.
+    overflow: iced::Padding,
     // for transitions, would need windows in more than one workspace? But don't capture all of
     // them all the time every frame.
 }
@@ -198,6 +204,13 @@ struct App {
     scroll: DiscreteScrollState,
     dbus_interface: Option<dbus::Interface>,
     panel_configs: HashMap<String, Option<CosmicPanelConfig>>,
+    swipe_deaccel: swipe::Deaccel,
+    natural_scroll: bool,
+    /// Layer surface the pointer was last on, to know which output a
+    /// touchpad swipe is meant for.
+    pointer_surface: Option<SurfaceId>,
+    swipe: Option<swipe::Gesture>,
+    settle: Option<swipe::Settle>,
 }
 
 #[derive(Debug, Default)]
@@ -232,10 +245,45 @@ impl Toplevels {
 impl App {
     fn create_surface(&mut self, output: wl_output::WlOutput) -> Task<cosmic::Action<Msg>> {
         let id = SurfaceId::unique();
+        // During a swipe the outgoing workspace slides off the left (or top)
+        // edge. Its window previews are subsurfaces, and cosmic-comp places
+        // a layer surface by its bounding box including subsurfaces
+        // (smithay `LayerMap::layer_geometry`), so a subsurface at a
+        // negative x would shift the whole overview. Extending the surface
+        // one output past that edge with a negative margin keeps every
+        // subsurface at non-negative coordinates.
+        let (width, height) = self
+            .outputs
+            .iter()
+            .find(|o| o.handle == output)
+            .map_or((0, 0), |o| (o.width, o.height));
+        let (overflow, margin) = match self.conf.workspace_config.workspace_layout {
+            cosmic_comp_config::workspace::WorkspaceLayout::Horizontal => {
+                let w = width + swipe::OVERFLOW_SLACK;
+                (
+                    iced::Padding::ZERO.left(w as f32),
+                    IcedMargin {
+                        left: -w,
+                        ..Default::default()
+                    },
+                )
+            }
+            cosmic_comp_config::workspace::WorkspaceLayout::Vertical => {
+                let h = height + swipe::OVERFLOW_SLACK;
+                (
+                    iced::Padding::ZERO.top(h as f32),
+                    IcedMargin {
+                        top: -h,
+                        ..Default::default()
+                    },
+                )
+            }
+        };
         self.layer_surfaces.insert(
             id,
             LayerSurface {
                 output: output.clone(),
+                overflow,
             },
         );
         get_layer_surface(SctkLayerSurfaceSettings {
@@ -246,6 +294,7 @@ impl App {
             size: Some((None, None)),
             output: IcedOutput::Output(output),
             anchor: Anchor::all(),
+            margin,
             ..Default::default()
         })
     }
@@ -304,6 +353,8 @@ impl App {
         }
 
         self.visible = false;
+        self.swipe = None;
+        self.finish_settle();
         self.update_capture_filter();
         self.drag_surface = None;
         Task::batch(
@@ -320,18 +371,61 @@ impl App {
         }
     }
 
+    /// Workspaces whose windows are captured while the overview is open: the
+    /// active one and its neighbours (so a swipe can show them right away),
+    /// plus, during a swipe, every workspace the strip passes over.
+    fn toplevel_capture_workspaces(&self) -> Vec<ExtWorkspaceHandleV1> {
+        let mut handles = Vec::new();
+        for output in &self.outputs {
+            let workspaces = self
+                .workspaces
+                .for_output(&output.handle)
+                .collect::<Vec<_>>();
+            let Some(active) = workspaces.iter().position(|w| w.is_active()) else {
+                continue;
+            };
+            let (mut lo, mut hi) = (active as f32, active as f32);
+            if let Some(pos) = self.strip_pos(&output.handle) {
+                lo = lo.min(pos.floor());
+                hi = hi.max(pos.ceil());
+            }
+            let settle_target = self
+                .settle
+                .as_ref()
+                .filter(|s| s.output == output.handle)
+                .and_then(|s| workspaces.iter().position(|w| w.handle() == &s.target));
+            if let Some(idx) = settle_target {
+                lo = lo.min(idx as f32);
+                hi = hi.max(idx as f32);
+            }
+            let last = workspaces.len() - 1;
+            let lo = (lo - 1.0).max(0.0) as usize;
+            let hi = ((hi + 1.0) as usize).min(last);
+            for workspace in &workspaces[lo..=hi] {
+                if !handles.contains(workspace.handle()) {
+                    handles.push(workspace.handle().clone());
+                }
+            }
+        }
+        handles
+    }
+
+    /// Re-send the capture filter if the swipe moved onto other workspaces.
+    fn refresh_capture_filter(&mut self) {
+        if self.visible
+            && self.toplevel_capture_workspaces() != self.capture_filter.toplevels_on_workspaces
+        {
+            self.update_capture_filter();
+        }
+    }
+
     fn update_capture_filter(&mut self) {
         let mut capture_filter = backend::CaptureFilter::default();
         if self.visible {
             capture_filter.workspaces_on_outputs =
                 self.outputs.iter().map(|x| x.handle.clone()).collect();
-            capture_filter.toplevels_on_workspaces = self
-                .workspaces
-                .0
-                .iter()
-                .filter(|x| x.is_active())
-                .map(|x| x.handle().clone())
-                .collect();
+            let handles = self.toplevel_capture_workspaces();
+            capture_filter.toplevels_on_workspaces = handles;
         }
 
         // Drop `CaptureImage` for workspaces and toplevels not matching new
@@ -349,6 +443,122 @@ impl App {
 
         self.capture_filter = capture_filter.clone();
         self.send_wayland_cmd(backend::Cmd::CaptureFilter(capture_filter));
+    }
+
+    /// Fractional workspace index shown on `output` while a swipe or its
+    /// settle animation is running; `None` when the overview is at rest.
+    fn strip_pos(&self, output: &wl_output::WlOutput) -> Option<f32> {
+        if let Some(gesture) = self
+            .swipe
+            .as_ref()
+            .filter(|g| g.is_active() && &g.output == output)
+        {
+            return Some(gesture.pos());
+        }
+        let settle = self.settle.as_ref().filter(|s| &s.output == output)?;
+        let idx = self
+            .workspaces
+            .for_output(output)
+            .position(|w| w.handle() == &settle.target)?;
+        Some(settle.pos(idx, std::time::Instant::now()))
+    }
+
+    /// End the settle animation and switch to the workspace it landed on.
+    fn finish_settle(&mut self) {
+        if let Some(settle) = self.settle.take() {
+            log::debug!(
+                "settle done: target active={:?}",
+                self.workspaces
+                    .for_handle(&settle.target)
+                    .map(|w| w.is_active())
+            );
+            if self
+                .workspaces
+                .for_handle(&settle.target)
+                .is_some_and(|w| !w.is_active())
+            {
+                self.send_wayland_cmd(backend::Cmd::ActivateWorkspace(settle.target));
+            }
+        }
+    }
+
+    fn swipe_output(&self) -> Option<wl_output::WlOutput> {
+        self.pointer_surface
+            .and_then(|id| self.layer_surfaces.get(&id))
+            .or_else(|| self.layer_surfaces.values().next())
+            .map(|s| s.output.clone())
+    }
+
+    fn handle_swipe(&mut self, event: backend::SwipeEvent) {
+        match event {
+            backend::SwipeEvent::Begin { fingers, .. } => {
+                log::debug!("swipe begin: fingers={fingers} visible={}", self.visible);
+                self.swipe = None;
+                if !self.visible || fingers < 3 || self.drag_surface.is_some() {
+                    return;
+                }
+                let Some(output) = self.swipe_output() else {
+                    return;
+                };
+                let count = self.workspaces.for_output(&output).count();
+                let Some(active) = self
+                    .workspaces
+                    .for_output(&output)
+                    .position(|w| w.is_active())
+                else {
+                    return;
+                };
+                // Grabbing a workspace that is still settling continues from
+                // where it is on screen.
+                let start = self.strip_pos(&output).unwrap_or(active as f32);
+                self.swipe = Some(swipe::Gesture::new(
+                    output,
+                    self.conf.workspace_config.workspace_layout,
+                    self.natural_scroll,
+                    self.swipe_deaccel,
+                    start,
+                    count,
+                ));
+                self.settle = None;
+            }
+            backend::SwipeEvent::Update { time, dx, dy } => {
+                if let Some(gesture) = self.swipe.as_mut() {
+                    gesture.update(time, dx, dy);
+                    self.refresh_capture_filter();
+                }
+            }
+            backend::SwipeEvent::End { time, cancelled } => {
+                let Some(gesture) = self.swipe.take() else {
+                    return;
+                };
+                if !gesture.is_active() {
+                    return;
+                }
+                let target_idx = gesture.target(time);
+                log::debug!(
+                    "swipe end: pos={:.2} velocity={:.2} cancelled={cancelled} -> target {target_idx}",
+                    gesture.pos(),
+                    gesture.velocity(time)
+                );
+                let workspaces = self
+                    .workspaces
+                    .for_output(&gesture.output)
+                    .collect::<Vec<_>>();
+                let Some(target) = workspaces.get(target_idx) else {
+                    return;
+                };
+                // The workspace is activated when the animation ends: the
+                // compositor may add/remove empty workspaces on a switch,
+                // which would reflow the bar and shift indices mid-animation.
+                self.settle = Some(swipe::Settle::new(
+                    gesture.output.clone(),
+                    target.handle().clone(),
+                    target_idx,
+                    gesture.pos(),
+                    gesture.velocity(time),
+                ));
+            }
+        }
     }
 
     fn panel_regions(&self, output_handle: &wl_output::WlOutput) -> iced::Padding {
@@ -571,6 +781,9 @@ impl Application for App {
                     backend::Event::ToplevelCapabilities(capabilities) => {
                         self.toplevel_capabilities = capabilities;
                     }
+                    backend::Event::Swipe(event) => {
+                        self.handle_swipe(event);
+                    }
                 }
             }
             Msg::Close => {
@@ -656,6 +869,14 @@ impl Application for App {
             }
             Msg::CompConfig(c) => {
                 self.conf.workspace_config = c.workspaces;
+                self.swipe_deaccel = swipe::Deaccel::new(c.input_touchpad.acceleration.as_ref());
+                // What cosmic-comp uses for its workspace swipe direction.
+                self.natural_scroll = c
+                    .input_touchpad
+                    .scroll_config
+                    .as_ref()
+                    .and_then(|s| s.natural_scroll)
+                    .unwrap_or(false);
             }
             Msg::BgConfig(c) => {
                 self.conf.bg = c;
@@ -673,10 +894,14 @@ impl Application for App {
                     // TODO assumes only one active workspace per output
                     let workspaces = self.workspaces.for_output(&output).collect::<Vec<_>>();
                     if let Some(workspace_idx) = workspaces.iter().position(|i| i.is_active()) {
-                        // Add delta_num, to index wrapping around
+                        // Stop at the first/last workspace instead of wrapping
+                        // around, like the touchpad swipe.
                         let new_workspace_idx = (workspace_idx as isize - discrete_delta.y)
-                            .rem_euclid(workspaces.len() as isize)
+                            .clamp(0, workspaces.len() as isize - 1)
                             as usize;
+                        if new_workspace_idx == workspace_idx {
+                            return Task::none();
+                        }
                         let workspace = workspaces[new_workspace_idx];
                         self.send_wayland_cmd(backend::Cmd::ActivateWorkspace(
                             workspace.handle().clone(),
@@ -750,6 +975,20 @@ impl Application for App {
             Msg::PanelConfig(config) => {
                 self.panel_configs.insert(config.name.clone(), Some(config));
             }
+            Msg::PointerSurface(id) => {
+                self.pointer_surface = Some(id);
+            }
+            Msg::Frame => {
+                if self
+                    .settle
+                    .as_ref()
+                    .is_some_and(|s| s.is_done(std::time::Instant::now()))
+                {
+                    self.finish_settle();
+                } else {
+                    self.refresh_capture_filter();
+                }
+            }
             Msg::Ignore => {}
         }
 
@@ -768,7 +1007,8 @@ impl Application for App {
     }
 
     fn subscription(&self) -> Subscription<Msg> {
-        let events = iced::event::listen_with(|evt, _, _| match evt {
+        let events = iced::event::listen_with(|evt, _, id| match evt {
+            iced::Event::Mouse(iced::mouse::Event::CursorEntered) => Some(Msg::PointerSurface(id)),
             iced::Event::PlatformSpecific(iced::event::PlatformSpecific::Wayland(evt)) => {
                 if !matches!(evt, WaylandEvent::RequestResize) {
                     Some(Msg::WaylandEvent(evt))
@@ -836,6 +1076,9 @@ impl Application for App {
         }
         if let Some(interface) = &self.dbus_interface {
             subscriptions.push(interface.subscription().map(Msg::DBus));
+        }
+        if self.settle.is_some() {
+            subscriptions.push(iced::time::every(Duration::from_millis(8)).map(|_| Msg::Frame));
         }
         subscriptions.push(panel_subscriptions(self.panel_configs.keys()));
         iced::Subscription::batch(subscriptions)

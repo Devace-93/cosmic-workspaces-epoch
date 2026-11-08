@@ -98,6 +98,17 @@ pub(crate) fn layer_surface<'a>(
         .flat_map(|t| &t.info.workspace)
         .collect::<HashSet<_>>();
     let layout = app.conf.workspace_config.workspace_layout;
+    // While swiping, highlight the workspace the strip is closest to, so the
+    // selection moves along (several times on a long or fast swipe).
+    let strip_pos = app.strip_pos(&surface.output);
+    let highlight = strip_pos.and_then(|pos| {
+        let workspaces = app
+            .workspaces
+            .for_output(&surface.output)
+            .collect::<Vec<_>>();
+        let idx = (pos.round().max(0.0) as usize).min(workspaces.len().checked_sub(1)?);
+        Some(workspaces[idx].handle())
+    });
     let sidebar = workspaces_sidebar(
         app.workspaces.for_output(&surface.output),
         &workspaces_with_toplevels,
@@ -105,27 +116,44 @@ pub(crate) fn layer_surface<'a>(
         layout,
         app.drop_target.as_ref(),
         drag_workspace,
+        highlight,
     );
-    let toplevels = toplevel_previews(
-        app.toplevels.0.iter().filter(|i| {
-            if !i.info.output.contains(&surface.output) {
-                return false;
-            }
-
-            i.info.workspace.iter().any(|workspace| {
-                app.workspaces
-                    .for_handle(workspace)
-                    .is_some_and(|x| x.is_active())
-            })
-        }),
-        layout,
-        drag_toplevel,
-    );
+    let toplevels_on = move |workspace: &'a backend::ExtWorkspaceHandleV1| {
+        app.toplevels.0.iter().filter(move |i| {
+            i.info.output.contains(&surface.output) && i.info.workspace.contains(workspace)
+        })
+    };
     // TODO multiple active workspaces? Not currently supported by cosmic.
     let first_active_workspace = app
         .workspaces
         .for_output(&surface.output)
         .find(|w| w.is_active());
+    let toplevels = if let Some(pos) = strip_pos {
+        // A touchpad swipe (or the animation after it) is moving between
+        // workspaces: show the ones in view side by side.
+        let workspaces = app
+            .workspaces
+            .for_output(&surface.output)
+            .collect::<Vec<_>>();
+        let pages = crate::swipe::visible_pages(pos, workspaces.len())
+            .into_iter()
+            .map(|(idx, offset)| {
+                let page = toplevel_previews(
+                    toplevels_on(workspaces[idx].handle()),
+                    layout,
+                    drag_toplevel,
+                );
+                (offset, page)
+            })
+            .collect();
+        let (width, height) = toplevel_previews_size(layout);
+        crate::widgets::workspace_strip(pages, crate::swipe::layout_axis(layout), width, height)
+            .into()
+    } else if let Some(workspace) = first_active_workspace {
+        toplevel_previews(toplevels_on(workspace.handle()), layout, drag_toplevel)
+    } else {
+        toplevel_previews(std::iter::empty(), layout, drag_toplevel)
+    };
     let toplevels = if let Some(workspace) = first_active_workspace {
         dnd_destination_for_target(
             DropTarget::OutputToplevels(workspace.handle().clone(), surface.output.clone()),
@@ -152,7 +180,12 @@ pub(crate) fn layer_surface<'a>(
     };
 
     let panel_regions = app.panel_regions(&surface.output);
-    let container = widget::container(container).padding(panel_regions);
+    let padding = iced::Padding {
+        top: panel_regions.top + surface.overflow.top,
+        left: panel_regions.left + surface.overflow.left,
+        ..panel_regions
+    };
+    let container = widget::container(container).padding(padding);
 
     let output = surface.output.clone();
     widget::mouse_area(container)
@@ -247,6 +280,7 @@ fn workspace_item(
     layout: WorkspaceLayout,
     is_drop_target: bool,
     has_workspace_drag: bool,
+    highlighted: bool,
 ) -> cosmic::Element<'static, Msg> {
     let (mut image, image_height, image_width) = if let Some(img) = workspace.img.as_ref() {
         let is_rotated = matches!(
@@ -310,7 +344,7 @@ fn workspace_item(
         .max_height(image_height + 28.0)
         .max_width(image_width);
 
-    let is_active = workspace.is_active() && !has_workspace_drag;
+    let is_active = highlighted && !has_workspace_drag;
     // TODO editable name?
     let mut button = widget::button::custom(content)
         .selected(is_active)
@@ -357,7 +391,7 @@ fn workspace_drag_placeholder(
         })
         .padding(8);
     let placeholder = crate::widgets::match_size(
-        workspace_item(other_workspace, other_output, layout, true, true),
+        workspace_item(other_workspace, other_output, layout, true, true, false),
         placeholder,
     );
     dnd_destination_for_target(drop_target, placeholder.into(), Msg::DndWorkspaceDrop)
@@ -370,6 +404,7 @@ fn workspace_sidebar_entry<'a>(
     is_drop_target: bool,
     has_toplevels: bool,
     has_workspace_drag: bool,
+    highlighted: bool,
 ) -> cosmic::Element<'a, Msg> {
     /* XXX
     let mouse_interaction = if is_drop_target {
@@ -384,6 +419,7 @@ fn workspace_sidebar_entry<'a>(
         layout,
         is_drop_target,
         has_workspace_drag,
+        highlighted,
     );
     let item = iced::widget::mouse_area(item)
         .on_enter(Msg::EnteredWorkspaceSidebarEntry(
@@ -415,7 +451,7 @@ fn workspace_sidebar_entry<'a>(
             DragSurface::Workspace(workspace.handle().clone()),
             Some(workspace.dnd_source_id.clone()),
             destination,
-            move || workspace_item(&workspace_clone, &output_clone, layout, false, true),
+            move || workspace_item(&workspace_clone, &output_clone, layout, false, true, false),
         )
     } else {
         destination
@@ -430,6 +466,7 @@ fn workspaces_sidebar<'a>(
     layout: WorkspaceLayout,
     drop_target: Option<&DropTarget>,
     drag_workspace: Option<&'a backend::ExtWorkspaceHandleV1>,
+    highlight: Option<&backend::ExtWorkspaceHandleV1>,
 ) -> cosmic::Element<'a, Msg> {
     let mut sidebar_entries = Vec::new();
     for workspace in workspaces {
@@ -442,7 +479,7 @@ fn workspaces_sidebar<'a>(
                 DragSurface::Workspace(workspace.handle().clone()),
                 Some(workspace.dnd_source_id.clone()),
                 widget::Space::new(Length::Shrink, Length::Shrink).into(),
-                move || workspace_item(&workspace_clone, &output_clone, layout, false, true),
+                move || workspace_item(&workspace_clone, &output_clone, layout, false, true, false),
             );
             sidebar_entries.push(source);
             continue;
@@ -477,6 +514,7 @@ fn workspaces_sidebar<'a>(
             drop_target_is_workspace && drag_workspace.is_none(),
             workspaces_with_toplevels.contains(workspace.handle()),
             drag_workspace.is_some(),
+            highlight.map_or(workspace.is_active(), |h| h == workspace.handle()),
         ));
     }
     let (axis, width, height) = match layout {
@@ -602,16 +640,18 @@ fn toplevel_previews<'a>(
     layout: WorkspaceLayout,
     drag_toplevel: Option<&'a backend::ExtForeignToplevelHandleV1>,
 ) -> cosmic::Element<'a, Msg> {
-    let (width, height) = match layout {
-        WorkspaceLayout::Vertical => (Length::FillPortion(4), Length::Fill),
-        WorkspaceLayout::Horizontal => (Length::Fill, Length::FillPortion(4)),
-    };
-    let entries = toplevels
+    let (width, height) = toplevel_previews_size(layout);
+    let entries: Vec<_> = toplevels
         .map(|t| toplevel_previews_entry(t, drag_toplevel == Some(&t.handle)))
         .collect();
+    let content = if entries.is_empty() {
+        empty_workspace_placeholder()
+    } else {
+        crate::widgets::toplevels(entries).into()
+    };
     //row(entries)
     widget::mouse_area(
-        widget::container(crate::widgets::toplevels(entries))
+        widget::container(content)
             .align_x(Alignment::Center)
             .width(width)
             .height(height)
@@ -621,6 +661,46 @@ fn toplevel_previews<'a>(
     .on_press(Msg::Close)
     //.align_items(Alignment::Center)
     .into()
+}
+
+/// Outline of an empty window, so an empty workspace still shows movement
+/// while swiping past it (otherwise every empty page looks identical).
+fn empty_workspace_placeholder() -> cosmic::Element<'static, Msg> {
+    let outline = widget::container(widget::Space::new(Length::Fill, Length::Fill))
+        .width(Length::FillPortion(2))
+        .height(Length::FillPortion(2))
+        .class(cosmic::theme::Container::custom(|theme| {
+            let cosmic = theme.cosmic();
+            let mut border_color: iced::Color = cosmic.on_bg_color().into();
+            border_color.a = 0.35;
+            let mut background: iced::Color = cosmic.background.base.into();
+            background.a = 0.25;
+            cosmic::iced::widget::container::Style {
+                background: Some(background.into()),
+                border: Border {
+                    color: border_color,
+                    width: 2.0,
+                    radius: cosmic.radius_s().map(|x| x + 4.0).into(),
+                },
+                ..Default::default()
+            }
+        }));
+    let spacer = || widget::Space::new(Length::FillPortion(1), Length::FillPortion(1));
+    column![
+        spacer(),
+        row![spacer(), outline, spacer()].height(Length::FillPortion(2)),
+        spacer(),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+fn toplevel_previews_size(layout: WorkspaceLayout) -> (Length, Length) {
+    match layout {
+        WorkspaceLayout::Vertical => (Length::FillPortion(4), Length::Fill),
+        WorkspaceLayout::Horizontal => (Length::Fill, Length::FillPortion(4)),
+    }
 }
 
 fn capture_image(image: Option<&CaptureImage>, alpha: f32) -> cosmic::Element<'static, Msg> {
