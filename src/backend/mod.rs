@@ -81,6 +81,17 @@ pub enum Event {
     ToplevelCapabilities(
         Vec<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>,
     ),
+    Swipe(SwipeEvent),
+}
+
+/// Touchpad swipe gesture (`zwp_pointer_gesture_swipe_v1`) on one of our
+/// surfaces. `time` is in milliseconds; `dx`/`dy` in surface-local units.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub enum SwipeEvent {
+    Begin { time: u32, fingers: u32 },
+    Update { time: u32, dx: f64, dy: f64 },
+    End { time: u32, cancelled: bool },
 }
 
 #[derive(Debug)]
