@@ -719,7 +719,7 @@ fn empty_workspace_placeholder() -> cosmic::Element<'static, Msg> {
             let cosmic = theme.cosmic();
             let mut border_color: iced::Color = cosmic.on_bg_color().into();
             border_color.a = 0.35;
-            let mut background: iced::Color = cosmic.background.base.into();
+            let mut background: iced::Color = cosmic.background(false).base.into();
             background.a = 0.25;
             cosmic::iced::widget::container::Style {
                 background: Some(background.into()),

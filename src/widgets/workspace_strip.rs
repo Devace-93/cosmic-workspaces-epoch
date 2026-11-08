@@ -20,7 +20,7 @@ use cosmic::iced::{
         mouse, renderer,
         widget::{Operation, Tree},
     },
-    event::{self, Event},
+    event::Event,
 };
 
 const GAP: f32 = 24.0;
@@ -55,21 +55,22 @@ impl<Msg> Widget<Msg, cosmic::Theme, cosmic::Renderer> for WorkspaceStrip<'_, Ms
     }
 
     fn layout(
-        &self,
+        &mut self,
         tree: &mut Tree,
         renderer: &cosmic::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
         let size = limits.resolve(self.width, self.height, Size::ZERO);
         let child_limits = layout::Limits::new(Size::ZERO, size);
+        let axis = &self.axis;
         let children = self
             .children
-            .iter()
+            .iter_mut()
             .zip(&mut tree.children)
             .zip(&self.offsets)
             .map(|((child, tree), offset)| {
-                let node = child.as_widget().layout(tree, renderer, &child_limits);
-                let position = match self.axis {
+                let node = child.as_widget_mut().layout(tree, renderer, &child_limits);
+                let position = match axis {
                     Axis::Horizontal => Point::new(offset * (size.width + GAP), 0.0),
                     Axis::Vertical => Point::new(0.0, offset * (size.height + GAP)),
                 };
@@ -80,7 +81,7 @@ impl<Msg> Widget<Msg, cosmic::Theme, cosmic::Renderer> for WorkspaceStrip<'_, Ms
     }
 
     fn operate(
-        &self,
+        &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
         renderer: &cosmic::Renderer,
@@ -88,44 +89,35 @@ impl<Msg> Widget<Msg, cosmic::Theme, cosmic::Renderer> for WorkspaceStrip<'_, Ms
     ) {
         for ((child, tree), layout) in self
             .children
-            .iter()
+            .iter_mut()
             .zip(&mut tree.children)
             .zip(layout.children())
         {
-            child.as_widget().operate(tree, layout, renderer, operation);
+            child.as_widget_mut().operate(tree, layout, renderer, operation);
         }
     }
 
-    fn on_event(
+    fn update(
         &mut self,
         tree: &mut Tree,
-        event: Event,
+        event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         renderer: &cosmic::Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Msg>,
         viewport: &Rectangle,
-    ) -> event::Status {
-        let mut status = event::Status::Ignored;
+    ) {
         for ((child, tree), layout) in self
             .children
             .iter_mut()
             .zip(&mut tree.children)
             .zip(layout.children())
         {
-            status = status.merge(child.as_widget_mut().on_event(
-                tree,
-                event.clone(),
-                layout,
-                cursor,
-                renderer,
-                clipboard,
-                shell,
-                viewport,
-            ));
+            child.as_widget_mut().update(
+                tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+            );
         }
-        status
     }
 
     fn mouse_interaction(
