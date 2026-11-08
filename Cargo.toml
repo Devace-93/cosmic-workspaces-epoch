@@ -25,7 +25,7 @@ freedesktop-icons = { package = "cosmic-freedesktop-icons", git = "https://githu
 
 memmap2 = "0.9.10"
 tokio = "1.49.0"
-wayland-protocols = "0.32.10"
+wayland-protocols = { version = "0.32.10", features = ["client", "unstable"] }
 delegate = "0.13.5"
 itertools = "0.14.0"
 log = "0.4.29"
