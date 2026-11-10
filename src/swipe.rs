@@ -46,6 +46,20 @@ const AXIS_LOCK_MM: f64 = 1.5;
 /// Window used to estimate finger speed for the acceleration inverse.
 const SPEED_WINDOW_MS: u32 = 40;
 
+/// Whether swiping past the last workspace brings in the first one (and the
+/// other way round). cosmic-comp at this revision always wraps its own swipe
+/// and shortcuts and has no `workspace_wraparound` setting yet, so the
+/// overview wraps too; `COSMIC_WORKSPACES_SWIPE_WRAP=0` stops at the ends.
+pub fn wraparound() -> bool {
+    static WRAP: OnceLock<bool> = OnceLock::new();
+    *WRAP.get_or_init(|| {
+        !matches!(
+            std::env::var("COSMIC_WORKSPACES_SWIPE_WRAP").as_deref(),
+            Ok("0" | "false" | "no" | "off")
+        )
+    })
+}
+
 fn page_mm() -> f64 {
     static PAGE_MM: OnceLock<f64> = OnceLock::new();
     *PAGE_MM.get_or_init(|| {
@@ -152,8 +166,8 @@ pub struct Gesture {
     start_pos: f32,
     /// Number of workspaces on the output.
     count: usize,
-    /// cosmic-comp's `workspace_wraparound`: past the last workspace comes
-    /// the first one again (and the other way round) instead of a rubber band.
+    /// [`wraparound`]: past the last workspace comes the first one again
+    /// (and the other way round) instead of a rubber band.
     wrap: bool,
     /// `None` until the fingers moved far enough to pick an axis; then
     /// whether that axis is the workspace axis.

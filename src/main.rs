@@ -399,7 +399,7 @@ impl App {
                 lo = lo.min(page);
                 hi = hi.max(page);
             }
-            let wrap = self.conf.workspace_config.workspace_wraparound;
+            let wrap = swipe::wraparound();
             // At most one lap: further pages would only repeat workspaces.
             let hi = (hi + 1.0).min(lo - 1.0 + workspaces.len() as f32);
             let mut page = lo - 1.0;
@@ -533,7 +533,7 @@ impl App {
                     self.swipe_deaccel,
                     start,
                     count,
-                    self.conf.workspace_config.workspace_wraparound,
+                    swipe::wraparound(),
                 ));
                 self.settle = None;
             }
@@ -555,7 +555,7 @@ impl App {
                     .workspaces
                     .for_output(&gesture.output)
                     .collect::<Vec<_>>();
-                let wrap = self.conf.workspace_config.workspace_wraparound;
+                let wrap = swipe::wraparound();
                 let Some(target_idx) = swipe::page_index(target_page, workspaces.len(), wrap)
                 else {
                     return;
@@ -914,11 +914,15 @@ impl Application for App {
                     // TODO assumes only one active workspace per output
                     let workspaces = self.workspaces.for_output(&output).collect::<Vec<_>>();
                     if let Some(workspace_idx) = workspaces.iter().position(|i| i.is_active()) {
-                        // Stop at the first/last workspace instead of wrapping
-                        // around, like the touchpad swipe.
-                        let new_workspace_idx = (workspace_idx as isize - discrete_delta.y)
-                            .clamp(0, workspaces.len() as isize - 1)
-                            as usize;
+                        // Wrap around or stop at the ends, like the touchpad
+                        // swipe (see `swipe::wraparound`).
+                        let target = workspace_idx as isize - discrete_delta.y;
+                        let count = workspaces.len() as isize;
+                        let new_workspace_idx = if swipe::wraparound() {
+                            target.rem_euclid(count)
+                        } else {
+                            target.clamp(0, count - 1)
+                        } as usize;
                         if new_workspace_idx == workspace_idx {
                             return Task::none();
                         }

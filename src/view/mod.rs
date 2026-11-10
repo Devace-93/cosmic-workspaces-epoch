@@ -106,7 +106,7 @@ pub(crate) fn layer_surface<'a>(
             .workspaces
             .for_output(&surface.output)
             .collect::<Vec<_>>();
-        let wrap = app.conf.workspace_config.workspace_wraparound;
+        let wrap = crate::swipe::wraparound();
         let last = workspaces.len().checked_sub(1)? as f32;
         let page = if crate::swipe::wraps(wrap, workspaces.len()) {
             pos.round()
@@ -142,7 +142,7 @@ pub(crate) fn layer_surface<'a>(
             .workspaces
             .for_output(&surface.output)
             .collect::<Vec<_>>();
-        let wrap = app.conf.workspace_config.workspace_wraparound;
+        let wrap = crate::swipe::wraparound();
         let pages = crate::swipe::visible_pages(pos, workspaces.len(), wrap)
             .into_iter()
             .map(|(idx, offset)| {
