@@ -22,9 +22,12 @@ use std::{collections::VecDeque, sync::OnceLock, time::Instant};
 use crate::backend::ExtWorkspaceHandleV1;
 use cosmic::cctk::wayland_client::protocol::wl_output;
 
-/// Finger travel, in mm, for one full workspace. Override with
-/// `COSMIC_WORKSPACES_SWIPE_MM` to tune without rebuilding.
-const DEFAULT_PAGE_MM: f64 = 60.0;
+/// Finger travel, in mm, for one full workspace. Close to cosmic-comp's
+/// own swipe outside the overview (150 accelerated units, ~15 mm), so a
+/// touchpad and synthetic swipes (e.g. mousetouch) feel the same in and out
+/// of the overview. Override with `COSMIC_WORKSPACES_SWIPE_MM` to tune
+/// without rebuilding.
+const DEFAULT_PAGE_MM: f64 = 20.0;
 /// Velocity samples older than this are ignored (cosmic-comp `HISTORY_LIMIT`).
 const HISTORY_MS: u32 = 100;
 /// How far a fling coasts after release: `velocity * PROJECTION_S` pages.
